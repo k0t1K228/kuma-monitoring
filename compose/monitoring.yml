@@ -1,0 +1,90 @@
+name: kuma-monitoring
+
+services:
+  prometheus:
+    build: ../prometheus
+    image: kuma-prometheus:local
+    container_name: kuma-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - kuma-shared
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: kuma-node-exporter
+    restart: unless-stopped
+    command:
+      - --path.rootfs=/host
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+    networks:
+      - kuma-shared
+
+  cadvisor:
+    image: ghcr.io/google/cadvisor:0.60.3
+    container_name: kuma-cadvisor
+    restart: unless-stopped
+    privileged: true
+    devices:
+      - /dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    networks:
+      - kuma-shared
+
+  mysqld-exporter:
+    image: prom/mysqld-exporter:latest
+    container_name: kuma-mysqld-exporter
+    restart: unless-stopped
+    command:
+      - --mysqld.address=kuma-mariadb:3306
+      - --mysqld.username=exporter
+    environment:
+      MYSQLD_EXPORTER_PASSWORD: ${EXPORTER_PASSWORD:-exporterpass}
+    networks:
+      - kuma-shared
+
+  blackbox-exporter:
+    image: prom/blackbox-exporter:latest
+    container_name: kuma-blackbox-exporter
+    restart: unless-stopped
+    networks:
+      - kuma-shared
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: kuma-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin12345}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    networks:
+      - kuma-shared
+
+volumes:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  kuma-shared:
+    external: true

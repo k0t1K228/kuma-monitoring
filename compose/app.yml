@@ -1,0 +1,68 @@
+name: kuma-app
+
+services:
+  mariadb:
+    image: mariadb:11.4
+    container_name: kuma-mariadb
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:-rootpass}
+      MARIADB_DATABASE: kuma
+      MARIADB_USER: kuma
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD:-kumapass}
+    volumes:
+      - mariadb-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - kuma-shared
+
+  mariadb-exporter-user:
+    image: mariadb:11.4
+    container_name: kuma-mariadb-exporter-user
+    restart: "no"
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    entrypoint:
+      - mariadb
+      - -h
+      - mariadb
+      - -uroot
+      - "-p${MARIADB_ROOT_PASSWORD:-rootpass}"
+      - -e
+      - "CREATE USER IF NOT EXISTS 'exporter'@'%' IDENTIFIED BY '${EXPORTER_PASSWORD:-exporterpass}' WITH MAX_USER_CONNECTIONS 3; GRANT PROCESS, REPLICATION CLIENT, SELECT ON *.* TO 'exporter'@'%';"
+    networks:
+      - kuma-shared
+
+  uptime-kuma:
+    image: louislam/uptime-kuma:2
+    container_name: kuma-uptime-kuma
+    restart: unless-stopped
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    environment:
+      UPTIME_KUMA_DB_TYPE: mariadb
+      UPTIME_KUMA_DB_HOSTNAME: mariadb
+      UPTIME_KUMA_DB_PORT: "3306"
+      UPTIME_KUMA_DB_NAME: kuma
+      UPTIME_KUMA_DB_USERNAME: kuma
+      UPTIME_KUMA_DB_PASSWORD: ${MARIADB_PASSWORD:-kumapass}
+    volumes:
+      - kuma-data:/app/data
+    ports:
+      - "3001:3001"
+    networks:
+      - kuma-shared
+
+volumes:
+  mariadb-data:
+  kuma-data:
+
+networks:
+  kuma-shared:
+    external: true
