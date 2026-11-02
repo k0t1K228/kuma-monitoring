@@ -18,7 +18,7 @@ services:
       - kuma-shared
 
   node-exporter:
-    image: prom/node-exporter:latest
+    image: prom/node-exporter:v1.12.1
     container_name: kuma-node-exporter
     restart: unless-stopped
     command:
@@ -46,7 +46,7 @@ services:
       - kuma-shared
 
   mysqld-exporter:
-    image: prom/mysqld-exporter:latest
+    image: prom/mysqld-exporter:v0.21.0
     container_name: kuma-mysqld-exporter
     restart: unless-stopped
     command:
@@ -58,14 +58,14 @@ services:
       - kuma-shared
 
   blackbox-exporter:
-    image: prom/blackbox-exporter:latest
+    image: prom/blackbox-exporter:v0.29.1
     container_name: kuma-blackbox-exporter
     restart: unless-stopped
     networks:
       - kuma-shared
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:13.3.0
     container_name: kuma-grafana
     restart: unless-stopped
     environment:

@@ -157,6 +157,114 @@ retry "дашборд kuma-health есть в Grafana" 30 check_dashboard
 echo "ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ"
 """
 
+
+CHAOS_SCRIPT = r"""
+apk add --no-cache jq >/dev/null
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+
+case "$TARGET" in kuma-mariadb|kuma-uptime-kuma) ;; *) fail "target: kuma-mariadb или kuma-uptime-kuma" ;; esac
+case "$MODE" in stop|crash|both) ;; *) fail "mode: stop, crash или both" ;; esac
+
+cleanup() {
+  if [ "$(docker inspect -f '{{.State.Running}}' "$TARGET" 2>/dev/null)" != "true" ]; then
+    echo "очистка: возвращаю $TARGET в работу" >&2
+    docker start "$TARGET" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+now() { date +%s; }
+promget() { docker exec kuma-prometheus wget -qO- "http://localhost:9090$1"; }
+grafget() {
+  B=$(printf '%s:%s' "$GF_USER" "$GF_PASS" | base64 | tr -d '\n')
+  docker exec kuma-grafana wget -qO- --header "Authorization: Basic $B" "http://localhost:3000$1"
+}
+
+Q=$(jq -rn --arg x "$OVERALL" '$x|@uri')
+GQ="/api/datasources/proxy/uid/prometheus/api/v1/query?query=$Q"
+# Статус читаем через Grafana (путь, которым питается дашборд); если не вышло, напрямую из Prometheus
+if grafget "$GQ" 2>/dev/null | jq -e '.data.result[0].value[1]' >/dev/null 2>&1; then
+  SRC=grafana
+else
+  SRC=prometheus
+  echo "WARN: через Grafana статус прочитать не удалось, читаю из Prometheus"
+fi
+
+status() {
+  if [ "$SRC" = grafana ]; then r=$(grafget "$GQ" 2>/dev/null || true); else r=$(promget "/api/v1/query?query=$Q" 2>/dev/null || true); fi
+  v=$(printf '%s' "$r" | jq -r '.data.result[0].value[1] // "none"' 2>/dev/null || true)
+  printf '%s' "${v:-none}"
+}
+
+rm -f /tmp/seen0
+# wait_status <значение> <таймаут>: печатает, сколько секунд ждали
+wait_status() {
+  want="$1"; timeout="$2"; t0=$(now)
+  while :; do
+    s=$(status)
+    [ "$s" = "0" ] && : > /tmp/seen0
+    if [ "$s" = "$want" ]; then echo $(( $(now) - t0 )); return 0; fi
+    [ $(( $(now) - t0 )) -ge "$timeout" ] && return 1
+    sleep 2
+  done
+}
+
+phase_stop() {
+  echo "--- фаза STOP: docker stop $TARGET"
+  wait_status 1 120 >/dev/null || fail "перед тестом статус не ВСЁ ХОРОШО"
+  echo "OK: исходный статус ВСЁ ХОРОШО (источник: $SRC)"
+  ts=$(now)
+  docker stop "$TARGET" >/dev/null
+  echo "контейнер $TARGET остановлен (сама команда docker stop заняла $(( $(now) - ts )) с)"
+  wait_status 0 90 >/dev/null || fail "(а) статус ВСЁ ПЛОХО не появился за 90 с"
+  echo "OK (а): дашборд показывает ВСЁ ПЛОХО через $(( $(now) - ts )) с после начала docker stop"
+  # Docker не перезапускает вручную остановленные контейнеры, поэтому поднимаем вручную
+  docker start "$TARGET" >/dev/null
+  wait_healthy "$TARGET" 180
+  d=$(wait_status 1 240) || fail "после docker start статус не вернулся в ВСЁ ХОРОШО за 240 с"
+  echo "OK: после docker start дашборд вернулся в ВСЁ ХОРОШО через ${d} с"
+}
+
+phase_crash() {
+  echo "--- фаза CRASH: падение процесса $TARGET, восстановление только по restart-policy"
+  wait_status 1 120 >/dev/null || fail "перед тестом статус не ВСЁ ХОРОШО"
+  pol=$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$TARGET")
+  [ "$pol" != "no" ] || fail "у $TARGET не задана restart-policy"
+  echo "restart-policy: $pol"
+  rc0=$(docker inspect -f '{{.RestartCount}}' "$TARGET")
+  rm -f /tmp/seen0
+  pid=$(docker inspect -f '{{.State.Pid}}' "$TARGET")
+  img=$(docker inspect -f '{{.Config.Image}}' "$TARGET")
+  # SIGKILL по PID хоста в обход Docker API. Для Docker это падение процесса, а не ручная
+  # остановка (docker kill/stop отключают restart-policy), поэтому политика должна сработать.
+  docker run --rm --privileged --pid=host --entrypoint sh "$img" -c "kill -9 $pid" >/dev/null
+  echo "процесс $TARGET (PID хоста $pid) убит SIGKILL снаружи, дальше вмешательств нет"
+  t0=$(now)
+  while :; do
+    rc=$(docker inspect -f '{{.RestartCount}}' "$TARGET")
+    run=$(docker inspect -f '{{.State.Running}}' "$TARGET")
+    [ "$(status)" = "0" ] && : > /tmp/seen0
+    if [ "$rc" -gt "$rc0" ] && [ "$run" = "true" ]; then break; fi
+    [ $(( $(now) - t0 )) -ge 60 ] && fail "(б) restart-policy не перезапустила $TARGET за 60 с"
+    sleep 1
+  done
+  echo "OK (б): $TARGET перезапущен по restart-policy за $(( $(now) - t0 )) с (RestartCount $rc0 -> $rc)"
+  wait_healthy "$TARGET" 180
+  d=$(wait_status 1 240) || fail "после перезапуска статус не вернулся в ВСЁ ХОРОШО за 240 с"
+  echo "OK (б): дашборд вернулся в ВСЁ ХОРОШО через ${d} с после выхода контейнера из healthy-ожидания"
+  if [ -f /tmp/seen0 ]; then echo "наблюдение: окно ВСЁ ПЛОХО при падении было видно на дашборде"
+  else echo "наблюдение: окно ВСЁ ПЛОХО короче интервала сбора метрик (15 с) и не попало в выборку"; fi
+}
+
+case "$MODE" in
+  stop) phase_stop ;;
+  crash) phase_crash ;;
+  both) phase_stop; phase_crash ;;
+esac
+echo "CHAOS-ТЕСТ ПРОЙДЕН"
+"""
+
 # ------------------------------------------------------------------- помощники
 
 
@@ -213,6 +321,22 @@ async def _validate(
         .with_exec(["sh", "-c", VALIDATE_SCRIPT])
         .stdout()
     )
+
+
+async def _chaos(
+    sock: dagger.Socket, source: dagger.Directory, user: str, password: str, target: str, mode: str
+) -> str:
+    return await (
+        docker_cli(source, sock)
+        .with_env_variable("GF_USER", user)
+        .with_env_variable("GF_PASS", password)
+        .with_env_variable("OVERALL", OVERALL_EXPR)
+        .with_env_variable("TARGET", target)
+        .with_env_variable("MODE", mode)
+        .with_exec(["sh", "-c", PRELUDE + CHAOS_SCRIPT])
+        .stdout()
+    )
+
 
 
 # ----------------------------------------------------------------- Dagger-API
@@ -273,3 +397,19 @@ class KumaMonitoring:
             await _validate(docker_sock, source, admin_user, admin_password),
         ]
         return "\n".join(parts)
+
+    @function
+    async def chaos(
+        self,
+        docker_sock: DockerSock,
+        source: SourceDir,
+        target: Annotated[str, Doc("Контейнер для отказа: kuma-mariadb или kuma-uptime-kuma")] = "kuma-mariadb",
+        mode: Annotated[
+            str,
+            Doc("stop: docker stop (проверка 'Все Плохо'); crash: падение процесса SIGKILL (проверка restart-policy); both: оба"),
+        ] = "both",
+        admin_user: AdminUser = "admin",
+        admin_password: AdminPassword = "admin12345",
+    ) -> str:
+        """Chaos-тест: отказ контейнера, переход дашборда в 'Все Плохо' и восстановление."""
+        return await _chaos(docker_sock, source, admin_user, admin_password, target, mode)
